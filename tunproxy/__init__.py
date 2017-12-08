@@ -5,8 +5,13 @@ from socket import create_connection
 from select import select
 import json
 from urllib.parse import urlparse
-from binascii import b2a_base64
+import binascii
 import websocket
+
+
+def getconnected(self):
+    return True
+TapDevice.connected = property(getconnected)
 
 
 class WebSocketWrapper(object):
@@ -17,7 +22,12 @@ class WebSocketWrapper(object):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.ws.close()
+        if self.ws.connected:
+            self.ws.close()
+
+    @property
+    def connected(self):
+        return self.ws.connected
 
     def fileno(self):
         return self.ws.fileno()
@@ -25,7 +35,7 @@ class WebSocketWrapper(object):
     def read(self):
         return self.ws.recv()
 
-    def send(self, data):
+    def write(self, data):
         return self.ws.send_binary(data)
 
 
@@ -35,10 +45,10 @@ def start_server():
 
     with WebSocketWrapper(websocket.create_connection(config['upstream_url'])) as upstream:
         with TapDevice() as tun:
-            tun.ifconfig(address=config['tunnel_network'])
+            # tun.ifconfig(address=config['tunnel_network'])
             reverse_table = {
-                    tun: upstream,
-                    upstream: tun,
+                    tun: ('tun', upstream),
+                    upstream: ('upstream', tun),
             }
 
             print('Ready!')
@@ -47,11 +57,20 @@ def start_server():
                 try:
                     rlist, wlist, xlist = select([upstream, tun], [], [])
                     for r in rlist:
+                        if not r.connected:
+                            print('CLS[%8s]' % rid)
+                            raise KeyboardInterrupt
+                        rid, rev = reverse_table[r]
                         dgram = r.read()
-                        ip_version = (dgram[0] & 0b11110000) >> 4
-                        pkt = IP6(dgram) if ip_version == 6 else IP(dgram)
-                        print(pkt.__dict__)
-                        reverse_table[r].send(dgram)
+                        if not dgram:
+                            print('CLS[%8s]' % rid)
+                            raise KeyboardInterrupt
+
+                        print('RCV[%8s] %03d' % (rid, len(dgram)), binascii.b2a_hex(dgram))
+                        # ip_version = (dgram[0] & 0b11110000) >> 4
+                        # pkt = IP6(dgram) if ip_version == 6 else IP(dgram)
+                        # print('RCV[%s]' % rid, pkt.__dict__)
+                        rev.write(dgram)
                 except KeyboardInterrupt:
                     break
 
