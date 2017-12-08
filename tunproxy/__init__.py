@@ -6,35 +6,57 @@ from select import select
 import json
 from urllib.parse import urlparse
 from binascii import b2a_base64
-import aiohttp
+import websocket
 
-async def start_server():
+
+class WebSocketWrapper(object):
+    def __init__(self, ws):
+        self.ws = ws
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.ws.close()
+
+    def fileno(self):
+        return self.ws.fileno()
+
+    def read(self):
+        return self.ws.recv()
+
+    def send(self, data):
+        return self.ws.send_binary(data)
+
+
+def start_server():
     with open('tunproxy.json', 'r') as config_file:
         config = json.load(config_file)
 
-    async with aiohttp.ClientSession() as http:
-        async with http.ws_connect(config['upstream_url']) as ws:
-            await ws.send_str('hello')
-            with TapDevice() as tun:
-                tun.ifconfig(address=config['tunnel_network'])
+    with WebSocketWrapper(websocket.create_connection(config['upstream_url'])) as upstream:
+        with TapDevice() as tun:
+            tun.ifconfig(address=config['tunnel_network'])
+            reverse_table = {
+                    tun: upstream,
+                    upstream: tun,
+            }
 
-                print('Ready!')
+            print('Ready!')
 
-                while True:
-                    try:
-                        rlist, wlist, xlist = select([upstream, tun], [], [])
-                        for r in rlist:
-                            dgram = tun.read()
-                            ip_version = (dgram[0] & 0b11110000) >> 4
-                            pkt = IP6(dgram) if ip_version == 6 else IP(dgram)
-                            print(pkt.__dict__)
-                    except KeyboardInterrupt:
-                        break
+            while True:
+                try:
+                    rlist, wlist, xlist = select([upstream, tun], [], [])
+                    for r in rlist:
+                        dgram = r.read()
+                        ip_version = (dgram[0] & 0b11110000) >> 4
+                        pkt = IP6(dgram) if ip_version == 6 else IP(dgram)
+                        print(pkt.__dict__)
+                        reverse_table[r].send(dgram)
+                except KeyboardInterrupt:
+                    break
 
 if __name__ == '__main__':
-    import asyncio
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(start_server())
+    start_server()
 
 # $ curl -v http://google.com/
 # *   Trying 192.168.34.62...

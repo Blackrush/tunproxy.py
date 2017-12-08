@@ -4,22 +4,23 @@ from aiohttp import web
 
 async def handler(request):
     ws = web.WebSocketResponse()
-    print('START')
+    print('OPN')
     await ws.prepare(request)
     print('RUN')
 
-    async for msg in ws:
-        print('MSG', msg)
+    while True:
+        dgram = await ws.receive_bytes()
+        print('RCV', dgram)
 
-    print('CLOSE')
+    print('CLS')
 
     return ws
 
 
 async def main(loop):
     server = web.Server(handler)
-    await loop.create_server(server, "127.0.0.1", 8080)
-    print("======= Serving on http://127.0.0.1:8080/ ======")
+    await loop.create_server(server, "192.168.99.1", 8080)
+    print("======= Serving on http://192.168.99.1:8080/ ======")
 
     # pause here for very long time by serving HTTP requests and
     # waiting for keyboard interruption
