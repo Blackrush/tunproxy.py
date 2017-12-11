@@ -1,12 +1,18 @@
-from pytap2 import TapDevice
-from dpkt.ip import IP
-from dpkt.ip6 import IP6
+from pytap2 import TapDevice, TapMode
+from dpkt.ethernet import Ethernet
 from socket import create_connection
 from select import select
 import json
 from urllib.parse import urlparse
 import binascii
+import json
 import websocket
+from .net import parseip, debugip
+
+
+def prettymac(mac):
+    hexmac = binascii.hexlify(mac).decode('ascii')
+    return ':'.join(hexmac[i:i+2] for i in range(0, len(hexmac), 2))
 
 
 def getconnected(self):
@@ -38,6 +44,11 @@ class WebSocketWrapper(object):
     def write(self, data):
         return self.ws.send_binary(data)
 
+    def send_json(self, data):
+        return self.ws.send(json.dumps(data))
+    def recv_json(self):
+        return json.loads(self.read())
+
 
 def start_server():
     with open('tunproxy.json', 'r') as config_file:
@@ -45,12 +56,23 @@ def start_server():
 
     with WebSocketWrapper(websocket.create_connection(config['upstream_url'])) as upstream:
         with TapDevice() as tun:
-            # tun.ifconfig(address=config['tunnel_network'])
+            import pyroute2
+            ipr = pyroute2.IPRoute()
+            iface = ipr.link_lookup(ifname=tun.name)[0]
             reverse_table = {
                     tun: ('tun', upstream),
                     upstream: ('upstream', tun),
             }
 
+            upstream.send_json({'type': 'GET_IP'})
+            while True:
+                msg = upstream.recv_json()
+                if msg['type'] == 'SET_IP':
+                    ipr.addr('add', index=iface, address=msg['ip'], mask=msg['mask'])
+                    ipr.route('add', dst='default', gateway=msg['gw'])
+                    break
+
+            input('Press [Enter] to Start')
             print('Ready!')
 
             while True:
@@ -66,45 +88,19 @@ def start_server():
                             print('CLS[%8s]' % rid)
                             raise KeyboardInterrupt
 
-                        print('RCV[%8s] %03d' % (rid, len(dgram)), binascii.b2a_hex(dgram))
-                        # ip_version = (dgram[0] & 0b11110000) >> 4
-                        # pkt = IP6(dgram) if ip_version == 6 else IP(dgram)
-                        # print('RCV[%s]' % rid, pkt.__dict__)
+                        # pkt = Ethernet(dgram)
+                        # print('RCV', {
+                            # 'src': prettymac(pkt.src),
+                            # 'dst': prettymac(pkt.dst),
+                            # 'type': pkt.type,
+                            # 'data': pkt.data,
+                        # })
+                        pkt = parseip(dgram)
+                        # print('RCV[%8s] %03d' % (rid, len(dgram)), binascii.b2a_hex(dgram))
+                        print('RCV[%8s] %03d' % (rid, len(dgram)), debugip(pkt))
                         rev.write(dgram)
                 except KeyboardInterrupt:
                     break
 
-if __name__ == '__main__':
-    start_server()
-
-# $ curl -v http://google.com/
-# *   Trying 192.168.34.62...
-# * TCP_NODELAY set
-# * Connected to 192.168.34.62 (192.168.34.62) port 3128 (#0)
-# * Proxy auth using Basic with user '[REDACTED]'
-# > GET http://google.com/ HTTP/1.1
-# > Host: google.com
-# > Proxy-Authorization: Basic [REDACTED]
-# > User-Agent: curl/7.55.1
-# > Accept: */*
-# > Proxy-Connection: Keep-Alive
-# > 
-# < HTTP/1.1 302 Moved Temporarily
-# < Cache-Control: private
-# < Content-Type: text/html; charset=UTF-8
-# < Referrer-Policy: no-referrer
-# < Location: http://www.google.fr/?gfe_rd=cr&dcr=0&ei=iwooWpSlAe3t8wea1bKoCw
-# < Content-Length: 268
-# < Date: Wed, 06 Dec 2017 15:19:39 GMT
-# < X-Cache: MISS from inf-srv-enclos
-# < Via: 1.1 inf-srv-enclos (squid/3.2.5-20121213-r11739)
-# < Connection: keep-alive
-# < 
-# <HTML><HEAD><meta http-equiv="content-type" content="text/html;charset=utf-8">
-# <TITLE>302 Moved</TITLE></HEAD><BODY>
-# <H1>302 Moved</H1>
-# The document has moved
-# <A HREF="http://www.google.fr/?gfe_rd=cr&amp;dcr=0&amp;ei=iwooWpSlAe3t8wea1bKoCw">here</A>.
-# </BODY></HTML>
-# * Connection #0 to host 192.168.34.62 left intact
+            ipr.route('del', dst='default')
 
