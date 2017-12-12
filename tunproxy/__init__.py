@@ -88,16 +88,8 @@ def start_server():
                             print('CLS[%8s]' % rid)
                             raise KeyboardInterrupt
 
-                        # pkt = Ethernet(dgram)
-                        # print('RCV', {
-                            # 'src': prettymac(pkt.src),
-                            # 'dst': prettymac(pkt.dst),
-                            # 'type': pkt.type,
-                            # 'data': pkt.data,
-                        # })
                         pkt = parseip(dgram)
-                        # print('RCV[%8s] %03d' % (rid, len(dgram)), binascii.b2a_hex(dgram))
-                        print('RCV[%8s] %03d' % (rid, len(dgram)), debugip(pkt))
+                        print('RCV[%8s] %03d %r' % (rid, len(dgram), pkt))
                         rev.write(dgram)
                 except KeyboardInterrupt:
                     break
