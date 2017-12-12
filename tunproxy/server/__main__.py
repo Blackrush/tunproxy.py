@@ -10,6 +10,7 @@ import dpkt.ip
 import dpkt.icmp
 from dpkt.ip import IP
 from dpkt.udp import UDP
+from dpkt.icmp import ICMP
 
 
 BIND_ADDRESS = ip_address('192.168.99.101')
@@ -22,48 +23,86 @@ DNS_SERVER_ADDRESS = ip_address('192.168.1.254')
 ALLOW_IPV = [4]
 
 
+class Counter(object):
+    def __init__(self, initial=1):
+        self._value = initial
+    def get(self):
+        self._value += 1
+        return self._value
+
+
+CLIENTS = []
+IP_ID = Counter()
+
+
+def icmp_upstream_handler(upstream):
+    dgram, from_addr = upstream.recvfrom(1500)
+    pkt = parseip(dgram)
+    print('RCV[%8s] %03d %r' % ('upstream', len(dgram), pkt))
+
+    client_pkt = IP(
+        v=4,
+        id=IP_ID.get(),
+        src=pkt.src,
+        dst=PRIVATE_CLIENT_ADDRESS.packed,
+        p=dpkt.ip.IP_PROTO_ICMP,
+        off=dpkt.ip.IP_DF,
+        ttl=pkt.ttl - 1,
+        data=ICMP(
+            type=dpkt.icmp.ICMP_ECHOREPLY,
+            code=0,
+            data=pkt.data.data,
+        ),
+    )
+    client_dgram = bytes(client_pkt)
+    for ws in CLIENTS:
+        ws.send_bytes(client_dgram)
+
+
 def udp_upstream_handler(upstream, ws, nat):
     data, from_addr = upstream.recvfrom(1500)
-    dport = nat[('UDP', ip_address(from_addr[0]).packed, from_addr[1])]
-    pkt = IP(
-        id=1,
-        src=ip_address(from_addr[0]).packed,
+    src = ip_address(from_addr[0])
+    sport = from_addr[1]
+    dport = nat.get((dpkt.ip.IP_PROTO_UDP, src.packed, sport))
+    if not dport:
+        return
+
+    client_pkt = IP(
+        v=4,
+        id=IP_ID.get(),
+        src=src.packed,
         dst=PRIVATE_CLIENT_ADDRESS.packed,
         p=dpkt.ip.IP_PROTO_UDP,
+        off=dpkt.ip.IP_DF,
+        ttl=64,
         data=UDP(
-            sport=from_addr[1],
+            sport=sport,
             dport=dport,
             ulen=8+len(data),
             data=data,
         ),
     )
-    dgram = bytes(pkt)
-    print('RCV[%8s] %03d %r' % ('upstream', len(dgram), pkt))
-    ws.send_bytes(dgram)
-
-
-def icmp_upstream_handler(upstream, ws, nat):
-    dgram, from_addr = upstream.recvfrom(1500)
-    pkt = parseip(dgram)
-    print('RCV[%8s] %03d %r' % ('upstream', len(dgram), pkt))
+    print('RCV[%8s] %03d %r' % ('upstream', len(client_pkt), client_pkt))
+    ws.send_bytes(bytes(client_pkt))
 
 
 def tcp_upstream_handler(upstream, ws, nat):
     data = upstream.recv(1500)
-    print('RCV[%8s] %03d %r' % ('upstream', len(dgram), pkt))
+    # print('RCV[%8s] %03d %r' % ('upstream', len(dgram), pkt))
 
 
 async def handler(request):
     print('OPN')
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    
+
+    CLIENTS.append(ws)
     nat = {}
+    
+    # UDP
     udp_upstream = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     loop.add_reader(udp_upstream, udp_upstream_handler, udp_upstream, ws, nat)
-    icmp_upstream = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-    icmp_upstream.setsockopt(socket.SOL_IP, socket.IP_HDRINCL, 1)
-    loop.add_reader(icmp_upstream, icmp_upstream_handler, icmp_upstream, ws, nat)
+    # TCP
     tcp_upstreams = {}
 
     while True:
@@ -89,22 +128,29 @@ async def handler(request):
             if pkt.v not in ALLOW_IPV:
                 continue
 
-            pktproto = type(pkt.data).__name__
-
             if pkt.p == dpkt.ip.IP_PROTO_ICMP:
                 if pkt.dst == PRIVATE_SERVER_ADDRESS.packed:
-                    pkt.src, pkt.dst = pkt.dst, pkt.src
-                    ws.send_bytes(bytes(pkt))
+                    await ws.send_bytes(bytes(IP(
+                        v=4,
+                        id=IP_ID.get(),
+                        src=PRIVATE_SERVER_ADDRESS.packed,
+                        dst=PRIVATE_CLIENT_ADDRESS.packed,
+                        p=dpkt.ip.IP_PROTO_ICMP,
+                        off=dpkt.ip.IP_DF,
+                        ttl=64,
+                        data=ICMP(
+                            type=dpkt.icmp.ICMP_ECHOREPLY,
+                            code=0,
+                            data=pkt.data.data,
+                        ),
+                    )))
                 else:
-                    icmp_upstream.sendto(bytes(pkt.data), (str(ip_address(pkt.dst)), 0))
+                    pkt.src = PUBLIC_SERVER_ADDRESS.packed
+                    icmp_upstream.sendto(bytes(pkt), (str(ip_address(pkt.dst)), 0))
 
             elif pkt.p == dpkt.ip.IP_PROTO_UDP:
-                pkt.src = PUBLIC_SERVER_ADDRESS.packed
-                if pkt.data.dport == 53:
-                    pkt.dst = DNS_SERVER_ADDRESS.packed
-
                 # do send
-                nat[(pktproto, pkt.dst, pkt.data.dport)] = pkt.data.sport
+                nat[(pkt.p, pkt.dst, pkt.data.dport)] = pkt.data.sport
                 udp_upstream.sendto(bytes(pkt.data.data), (str(ip_address(pkt.dst)), pkt.data.dport))
 
             elif pkt.p == pkt.ip.IP_PROTO_TCP:
@@ -158,11 +204,9 @@ async def handler(request):
 
 
     print('CLS')
+    CLIENTS.remove(ws)
     loop.remove_reader(udp_upstream)
     udp_upstream.close()
-    for address, tcp_upstream in tcp_upstreams.items():
-        loop.remove_reader(tcp_upstream)
-        tcp_upstream.close()
     return ws
 
 
@@ -172,6 +216,13 @@ def start_server(loop):
 
 
 loop = asyncio.get_event_loop()
+
+# UDP
+# ICMP
+icmp_upstream = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+icmp_upstream.setsockopt(socket.SOL_IP, socket.IP_HDRINCL, 1)
+loop.add_reader(icmp_upstream, icmp_upstream_handler, icmp_upstream)
+
 server = None
 try:
     server = start_server(loop)
