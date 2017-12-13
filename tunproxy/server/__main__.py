@@ -118,6 +118,7 @@ async def handler(request):
                     'ip': str(PRIVATE_CLIENT_ADDRESS),
                     'mask': PRIVATE_SERVER_MASK,
                     'gw': str(PRIVATE_SERVER_ADDRESS),
+                    'dns': str(DNS_SERVER_ADDRESS),
                 })
 
         elif msg.type == WSMsgType.BINARY:
@@ -154,8 +155,6 @@ async def handler(request):
                 udp_upstream.sendto(bytes(pkt.data.data), (str(ip_address(pkt.dst)), pkt.data.dport))
 
             elif pkt.p == pkt.ip.IP_PROTO_TCP:
-                pkt.src = PUBLIC_SERVER_ADDRESS.packed
-
                 # do send
                 if pkt.data.flags & dpkt.tcp.TH_SYN:
                     address = (str(ip_address(pkt.dst)), pkt.data.dport)

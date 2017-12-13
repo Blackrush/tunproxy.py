@@ -7,8 +7,9 @@ from urllib.parse import urlparse
 import binascii
 import json
 import websocket
-from .net import parseip, debugip
+import pyroute2
 
+ipr = pyroute2.IPRoute()
 
 def prettymac(mac):
     hexmac = binascii.hexlify(mac).decode('ascii')
@@ -54,10 +55,20 @@ def start_server():
     with open('tunproxy.json', 'r') as config_file:
         config = json.load(config_file)
 
+    with open('/etc/resolv.conf', 'r') as resolvconf_file:
+        resolvconf = resolvconf_file.readlines()
+
+    old_gw = None
+    for route in ipr.get_routes():
+        gw = route.get_attr('RTA_GATEWAY')
+        dst = route.get_attr('RTA_DST')
+        prefsrc = route.get_attr('RTA_PREFSRC')
+        if gw and not dst and not prefsrc:
+            old_gw = gw
+            break
+
     with WebSocketWrapper(websocket.create_connection(config['upstream_url'])) as upstream:
         with TapDevice() as tun:
-            import pyroute2
-            ipr = pyroute2.IPRoute()
             iface = ipr.link_lookup(ifname=tun.name)[0]
             reverse_table = {
                     tun: ('tun', upstream),
@@ -69,30 +80,32 @@ def start_server():
                 msg = upstream.recv_json()
                 if msg['type'] == 'SET_IP':
                     ipr.addr('add', index=iface, address=msg['ip'], mask=msg['mask'])
+                    if old_gw:
+                        ipr.route('del', dst='default')
                     ipr.route('add', dst='default', gateway=msg['gw'])
+                    with open('/etc/resolv.conf', 'w') as resolvconf_file:
+                        resolvconf_file.writelines([
+                            'nameserver %s' % msg['dns'],
+                        ])
                     break
-
-            input('Press [Enter] to Start')
-            print('Ready!')
 
             while True:
                 try:
                     rlist, wlist, xlist = select([upstream, tun], [], [])
                     for r in rlist:
                         if not r.connected:
-                            print('CLS[%8s]' % rid)
                             raise KeyboardInterrupt
                         rid, rev = reverse_table[r]
                         dgram = r.read()
                         if not dgram:
-                            print('CLS[%8s]' % rid)
                             raise KeyboardInterrupt
 
-                        pkt = parseip(dgram)
-                        print('RCV[%8s] %03d %r' % (rid, len(dgram), pkt))
                         rev.write(dgram)
                 except KeyboardInterrupt:
                     break
 
-            ipr.route('del', dst='default')
+    if old_gw:
+        ipr.route('add', dst='default', gateway=old_gw)
+    with open('/etc/resolv.conf', 'w') as resolvconf_file:
+        resolvconf_file.writelines(resolvconf)
 
