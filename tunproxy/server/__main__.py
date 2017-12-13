@@ -154,25 +154,28 @@ async def handler(request):
                 nat[(pkt.p, pkt.dst, pkt.data.dport)] = pkt.data.sport
                 udp_upstream.sendto(bytes(pkt.data.data), (str(ip_address(pkt.dst)), pkt.data.dport))
 
-            elif pkt.p == pkt.ip.IP_PROTO_TCP:
+            elif pkt.p == dpkt.ip.IP_PROTO_TCP:
                 # do send
                 if pkt.data.flags & dpkt.tcp.TH_SYN:
                     address = (str(ip_address(pkt.dst)), pkt.data.dport)
                     if address in tcp_upstreams:
                         continue
+
+                    tcp_upstream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     try:
-                        tcp_upstream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                         tcp_upstream.connect(address)
-                        tcp_upstreams[address] = tcp_upstream
-                        nat[(pktproto, pkt.dst, pkt.data.dport)] = pkt.data.sport
-                        loop.add_reader(tcp_upstream, tcp_upstream_handler, tcp_upstream, ws, nat)
-                        
-                        pkt.dst = PRIVATE_CLIENT_ADDRESS.packed
-                        pkt.src = ip_address(address[0]).packed
-                        pkt.flags |= dpkt.tcp.TH_ACK
-                        ws.send_bytes(bytes(pkt))
-                    except:
-                        pass
+                    except socket.timeout:
+                        continue
+                    tcp_upstreams[address] = tcp_upstream
+                    nat[(dpkt.ip.IP_PROTO_TCP, pkt.dst, pkt.data.dport)] = pkt.data.sport
+                    loop.add_reader(tcp_upstream, tcp_upstream_handler, tcp_upstream, ws, nat)
+                    
+                    pkt.id = IP_ID.get()
+                    pkt.dst = PRIVATE_CLIENT_ADDRESS.packed
+                    pkt.src = ip_address(address[0]).packed
+                    pkt.data.flags |= dpkt.tcp.TH_ACK
+                    ws.send_bytes(bytes(pkt))
+
                 elif pkt.data.flags & dpkt.tcp.TH_FIN:
                     address = (str(ip_address(pkt.dst)), pkt.data.dport)
                     tcp_upstream = tcp_upstreams.get(address)
