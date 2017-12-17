@@ -11,6 +11,7 @@ import dpkt.icmp
 from dpkt.ip import IP
 from dpkt.udp import UDP
 from dpkt.icmp import ICMP
+from dpkt.tcp import TCP
 
 
 BIND_ADDRESS = ip_address('192.168.99.101')
@@ -29,6 +30,140 @@ class Counter(object):
     def get(self):
         self._value += 1
         return self._value
+
+
+class TcpConnection(object):
+    CONTROL_METHODS = {
+            dpkt.tcp.TH_SYN: 'syn',
+            dpkt.tcp.TH_PUSH: 'push',
+            dpkt.tcp.TH_FIN: 'fin',
+    }
+
+    def __init__(self, loop, ws, addr, port):
+        self.loop = loop
+        self.ws = ws
+        self.seq = 0
+        self.seq_ack = 0
+        self.client_port = 0
+        self.client_seq = 0
+        self.addr = addr
+        self.port = port
+        self.sock = None
+
+    def gen_seq(self, inc=1):
+        seq = self.seq
+        self.seq += inc
+        return seq
+
+    def setup(self, sock):
+        self.sock = sock
+        self.loop.add_reader(sock, self.recv_upstream)
+
+    def cleanup(self):
+        if not self.sock:
+            return
+        self.loop.remove_reader(self.sock)
+        self.sock.close()
+        self.sock = None
+
+    def send_ip(self, **kwargs):
+        pkt = IP(
+            v=4,
+            id=IP_ID.get(),
+            src=self.addr.packed,
+            dst=PRIVATE_CLIENT_ADDRESS.packed,
+            p=dpkt.ip.IP_PROTO_TCP,
+            off=dpkt.ip.IP_DF,
+            ttl=64,
+            data=TCP(
+                sport=self.port,
+                dport=self.client_port,
+                **kwargs,
+            ),
+        )
+        dgram = bytes(pkt)
+        print('RCV[%8s] %03d %r' % ('upstream', len(dgram), pkt))
+        self.ws.send_bytes(dgram)
+
+    def handle(self, pkt):
+        if pkt.p != dpkt.ip.IP_PROTO_TCP:
+            return
+
+        self.client_seq = pkt.data.seq
+        for i in range(0, 8):
+            flag = 1 << i
+            control_method = TcpConnection.CONTROL_METHODS.get(flag)
+            if isinstance(control_method, str):
+                control_method = getattr(TcpConnection, control_method, None)
+            if control_method and pkt.data.flags & flag:
+                return control_method(self, pkt)
+
+    def syn(self, pkt):
+        if self.sock:
+            # do not overwrite existing connection
+            return
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.connect((str(self.addr), self.port))
+        except socket.timeout:
+            # do nothing and let the websocket retry
+            return
+        
+        self.setup(sock)
+        self.client_port = pkt.data.sport
+
+        self.send_ip(
+            seq=self.gen_seq(),
+            ack=self.client_seq + 1,
+            flags=dpkt.tcp.TH_SYN | dpkt.tcp.TH_ACK,
+            # TODO MSS
+        )
+
+    def push(self, pkt):
+        if not self.sock:
+            # do nothing
+            return
+
+        self.sock.send(pkt.data.data)
+
+        self.client_seq += pkt.len - 40
+        self.send_ip(
+            flags=dpkt.tcp.TH_ACK,
+            seq=self.seq,
+            ack=self.client_seq,
+        )
+
+    def fin(self, pkt=None):
+        if not self.sock:
+            # trying to close something already closed
+            return
+
+        self.cleanup()
+
+        self.send_ip(
+            flags=dpkt.tcp.TH_FIN | dpkt.tcp.TH_ACK,
+            seq=self.gen_seq(),
+            ack=self.client_seq + 1,
+        )
+
+    def recv_upstream(self):
+        data = self.sock.recv(1460)
+        if not data:
+            return self.fin()
+
+        self.push_now(data)
+
+    def push_now(self, data):
+        self.send_ip(
+            flags=dpkt.tcp.TH_PUSH | dpkt.tcp.TH_ACK,
+            seq=self.gen_seq(len(data)),
+            ack=self.client_seq,
+            data=data,
+        )
+
+    def ack(self, pkt):
+        pass # TODO re-send missed packets
 
 
 CLIENTS = []
@@ -86,11 +221,6 @@ def udp_upstream_handler(upstream, ws, nat):
     ws.send_bytes(bytes(client_pkt))
 
 
-def tcp_upstream_handler(upstream, ws, nat):
-    data = upstream.recv(1500)
-    # print('RCV[%8s] %03d %r' % ('upstream', len(dgram), pkt))
-
-
 async def handler(request):
     print('OPN')
     ws = web.WebSocketResponse()
@@ -103,7 +233,7 @@ async def handler(request):
     udp_upstream = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     loop.add_reader(udp_upstream, udp_upstream_handler, udp_upstream, ws, nat)
     # TCP
-    tcp_upstreams = {}
+    tcp_connections = {}
 
     while True:
         msg = await ws.receive()
@@ -155,49 +285,12 @@ async def handler(request):
                 udp_upstream.sendto(bytes(pkt.data.data), (str(ip_address(pkt.dst)), pkt.data.dport))
 
             elif pkt.p == dpkt.ip.IP_PROTO_TCP:
-                # do send
-                if pkt.data.flags & dpkt.tcp.TH_SYN:
-                    address = (str(ip_address(pkt.dst)), pkt.data.dport)
-                    if address in tcp_upstreams:
-                        continue
-
-                    tcp_upstream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    try:
-                        tcp_upstream.connect(address)
-                    except socket.timeout:
-                        continue
-                    tcp_upstreams[address] = tcp_upstream
-                    nat[(dpkt.ip.IP_PROTO_TCP, pkt.dst, pkt.data.dport)] = pkt.data.sport
-                    loop.add_reader(tcp_upstream, tcp_upstream_handler, tcp_upstream, ws, nat)
-                    
-                    pkt.id = IP_ID.get()
-                    pkt.dst = PRIVATE_CLIENT_ADDRESS.packed
-                    pkt.src = ip_address(address[0]).packed
-                    pkt.data.flags |= dpkt.tcp.TH_ACK
-                    ws.send_bytes(bytes(pkt))
-
-                elif pkt.data.flags & dpkt.tcp.TH_FIN:
-                    address = (str(ip_address(pkt.dst)), pkt.data.dport)
-                    tcp_upstream = tcp_upstreams.get(address)
-                    if not tcp_upstream:
-                        continue
-                    try:
-                        loop.remove_reader(tcp_upstream)
-                        tcp_upstream.close()
-                        del tcp_upstreams[address]
-                        
-                        pkt.dst = PRIVATE_CLIENT_ADDRESS.packed
-                        pkt.src = ip_address(address[0]).packed
-                        pkt.flags |= dpkt.tcp.TH_ACK
-                        ws.send_bytes(bytes(pkt))
-                    except:
-                        pass
-                else:
-                    address = (str(ip_address(pkt.dst)), pkt.data.dport)
-                    tcp_upstream = tcp_upstreams.get(address)
-                    if not tcp_upstream:
-                        continue
-                    tcp_upstream.send(pkt.data.data)
+                address = (pkt.dst, pkt.data.dport)
+                tcp_connection = tcp_connections.get(address)
+                if not tcp_connection:
+                    tcp_connection = TcpConnection(loop, ws, ip_address(pkt.dst), pkt.data.dport)
+                    tcp_connections[address] = tcp_connection
+                tcp_connection.handle(pkt)
 
             else:
                 print('do nothing for protocol', pktproto)
@@ -209,6 +302,8 @@ async def handler(request):
     CLIENTS.remove(ws)
     loop.remove_reader(udp_upstream)
     udp_upstream.close()
+    for tcp_connection in tcp_connections.values():
+        tcp_connection.cleanup()
     return ws
 
 
